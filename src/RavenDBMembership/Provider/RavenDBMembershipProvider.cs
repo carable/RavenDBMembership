@@ -256,7 +256,7 @@ namespace RavenDBMembership.Provider
             get { return false; }
         }
 
-        Action<ValidatePasswordEventArgs> IConfiguration.OnValidatingPassword { get { return this.OnValidatingPassword; } }
+        Action<ValidatePasswordEventArgs> IConfiguration.OnValidatingPassword { get { return base.OnValidatingPassword; } }
 
         public override string ResetPassword(string username, string answer)
         {
