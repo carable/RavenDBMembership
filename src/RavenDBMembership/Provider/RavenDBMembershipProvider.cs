@@ -7,10 +7,11 @@ using Raven.Abstractions.Exceptions;
 using Raven.Client;
 using Microsoft.Practices.ServiceLocation;
 using System.Collections.Specialized;
+using RavenDBMembership.Services;
 
 namespace RavenDBMembership.Provider
 {
-    public class RavenDBMembershipProvider : MembershipProviderValidated
+    public class RavenDBMembershipProvider : MembershipProvider, IConfiguration
     {
         private string _providerName = "RavenDBMembership";
         private IDocumentStore documentStore;
@@ -18,7 +19,7 @@ namespace RavenDBMembership.Provider
 
         public IDocumentStore DocumentStore
         {
-            get 
+            get
             {
                 if (documentStore == null)
                 {
@@ -40,7 +41,7 @@ namespace RavenDBMembership.Provider
             {
                 _minRequiredPasswordLength = int.Parse(config["minRequiredPasswordLength"]);
             }
-            
+
             // Try to find an IDocumentStore via Common Service Locator. 
             try
             {
@@ -55,29 +56,18 @@ namespace RavenDBMembership.Provider
             }
 
             _providerName = name;
-            
+
             base.Initialize(name, config);
         }
 
-        public override bool CheckedChangePassword(string username, string oldPassword, string newPassword)
+        public override bool ChangePassword(string username, string oldPassword, string newPassword)
         {
             using (var session = this.DocumentStore.OpenSession())
             {
-                var q = from u in session.Query<User>()
-                        where u.Username == username && u.ApplicationName == this.ApplicationName
-                        select u;
-                var user = q.SingleOrDefault();
-                if (user == null || user.PasswordHash != PasswordUtil.HashPassword(oldPassword, user.PasswordSalt))
-                {
-                    throw new MembershipPasswordException("Invalid username or old password.");
-                }
-
-                user.PasswordSalt = PasswordUtil.CreateRandomSalt();
-                user.PasswordHash = PasswordUtil.HashPassword(newPassword, user.PasswordSalt);
-
+                var success = Service(session).ChangePassword(username, oldPassword, newPassword);
                 session.SaveChanges();
+                return success;
             }
-            return true;
         }
 
         public override bool ChangePasswordQuestionAndAnswer(string username, string password, string newPasswordQuestion, string newPasswordAnswer)
@@ -85,48 +75,29 @@ namespace RavenDBMembership.Provider
             throw new NotImplementedException();
         }
 
-        public override MembershipUser CheckedCreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+        public override MembershipUser CreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
         {
-            if (password.Length < MinRequiredPasswordLength)
-                throw new MembershipCreateUserException(MembershipCreateStatus.InvalidPassword);
-
-            ValidatePasswordEventArgs args = new ValidatePasswordEventArgs(username, password, true);
-            OnValidatingPassword(args);
-            if (args.Cancel)
-            {
-                status = MembershipCreateStatus.InvalidPassword;
-                return null;
-            }
-
-            var user = new User();
-            user.Username = username;
-            password = password.Trim();
-            user.PasswordSalt = PasswordUtil.CreateRandomSalt();
-            user.PasswordHash = PasswordUtil.HashPassword(password, user.PasswordSalt);
-            user.Email = email;
-            user.ApplicationName = this.ApplicationName;
-            user.DateCreated = DateTime.Now;
-
             using (var session = this.DocumentStore.OpenSession())
             {
                 session.Advanced.UseOptimisticConcurrency = true;
 
                 try
                 {
-                    session.Store(user);
-                    session.Store(new ReservationForUniqueFieldValue { Id = "username/" + user.Username });
-                    session.Store(new ReservationForUniqueFieldValue { Id = "email/" + user.Email });
-
-                    session.SaveChanges();
-
-                    status = MembershipCreateStatus.Success;
-
-                    return new MembershipUser(_providerName, username, user.Id, email, null, null, true, false, user.DateCreated,
-                        new DateTime(1900, 1, 1), new DateTime(1900, 1, 1), DateTime.Now, new DateTime(1900, 1, 1));
+                    var user = Service(session).CreateUser(username, password, email, out status);
+                    if (status == MembershipCreateStatus.Success)
+                    {
+                        session.SaveChanges();
+                        return new MembershipUser(_providerName, username, user.Id, email, null, null, true, false, user.DateCreated,
+                            new DateTime(1900, 1, 1), new DateTime(1900, 1, 1), DateTime.Now, new DateTime(1900, 1, 1));
+                    }
+                    else
+                    {
+                        return null;
+                    }
                 }
                 catch (ConcurrencyException e)
                 {
-                    status = InterpretConcurrencyException(user.Username, user.Email, e);
+                    status = InterpretConcurrencyException(username, email, e);
                 }
                 catch (Exception ex)
                 {
@@ -152,34 +123,24 @@ namespace RavenDBMembership.Provider
             return status;
         }
 
-        public override bool CheckedDeleteUser(string username, bool deleteAllRelatedData)
+        public override bool DeleteUser(string username, bool deleteAllRelatedData)
         {
             using (var session = this.DocumentStore.OpenSession())
             {
                 try
                 {
-                    var q = from u in session.Query<User>().Customize(c => c.WaitForNonStaleResultsAsOfNow())
-                            where u.Username == username && u.ApplicationName == this.ApplicationName
-                            select u;
-                    var user = q.SingleOrDefault();
-                    if (user == null)
+                    if (Service(session).DeleteUser(username, deleteAllRelatedData))
                     {
-                        throw new NullReferenceException("The user could not be deleted.");
+                        session.SaveChanges();
+                        return true;
                     }
-
-                    session.Delete(session.Load<ReservationForUniqueFieldValue>("username/" + user.Username));
-                    session.Delete(session.Load<ReservationForUniqueFieldValue>("email/" + user.Email));
-
-                    session.Delete(user);
-                    session.SaveChanges();
-                    return true;
                 }
                 catch (Exception ex)
                 {
                     // TODO: log exception properly
                     Console.WriteLine(ex.ToString());
-                    return false;
                 }
+                return false;
             }
         }
 
@@ -295,6 +256,8 @@ namespace RavenDBMembership.Provider
             get { return false; }
         }
 
+        Action<ValidatePasswordEventArgs> IConfiguration.OnValidatingPassword { get { return this.OnValidatingPassword; } }
+
         public override string ResetPassword(string username, string answer)
         {
             using (var session = this.DocumentStore.OpenSession())
@@ -338,7 +301,7 @@ namespace RavenDBMembership.Provider
             }
             string username = user.UserName;
             SecUtility.CheckParameter(ref username, true, true, true, 0x100, "UserName");
-            
+
             string email = user.Email;
             SecUtility.CheckParameter(ref email, this.RequiresUniqueEmail, this.RequiresUniqueEmail, false, 0x100, "Email");
             user.Email = email;
@@ -363,7 +326,7 @@ namespace RavenDBMembership.Provider
                     if (originalEmail != user.Email)
                     {
                         session.Delete(session.Load<ReservationForUniqueFieldValue>("email/" + dbUser.Email));
-                        session.Store(new ReservationForUniqueFieldValue { Id = "email/" + user.Email});
+                        session.Store(new ReservationForUniqueFieldValue { Id = "email/" + user.Email });
                     }
 
                     dbUser.Username = user.UserName;
@@ -373,7 +336,7 @@ namespace RavenDBMembership.Provider
 
                     session.SaveChanges();
                 }
-                catch(ConcurrencyException ex)
+                catch (ConcurrencyException ex)
                 {
                     var status = InterpretConcurrencyException(user.UserName, user.Email, ex);
 
@@ -385,6 +348,11 @@ namespace RavenDBMembership.Provider
             }
         }
 
+        private RavenDBUserValidations Service(IDocumentSession session)
+        {
+            return new RavenDBUserValidations(new RavenDBUserService(session, this), this);
+        }
+
         public override bool ValidateUser(string username, string password)
         {
             var updateLastLogin = true;
@@ -392,28 +360,17 @@ namespace RavenDBMembership.Provider
             return CheckPassword(username, password, updateLastLogin);
         }
 
-        public override bool CheckPassword(string username, string password, bool updateLastLogin)
+        public bool CheckPassword(string username, string password, bool updateLastLogin)
         {
             username = username.Trim();
             password = password.Trim();
 
             using (var session = this.DocumentStore.OpenSession())
             {
-                var q = from u in session.Query<User>().Customize(c => c.WaitForNonStaleResultsAsOfNow())
-                        where u.Username == username && u.ApplicationName == this.ApplicationName
-                        select u;
-                var user = q.SingleOrDefault();
-                if (user != null && user.PasswordHash == PasswordUtil.HashPassword(password, user.PasswordSalt))
-                {
-                    if (updateLastLogin)
-                    {
-                        user.DateLastLogin = DateTime.Now;
-                    }
-                    session.SaveChanges();
-                    return true;
-                }
+                var success = Service(session).CheckPassword(username, password, updateLastLogin);
+                session.SaveChanges(); // we might want to log things (in the service) when a user tries to log on
+                return success;
             }
-            return false;
         }
 
         private MembershipUserCollection FindUsers(Func<User, bool> predicate, int pageIndex, int pageSize, out int totalRecords)
@@ -422,7 +379,7 @@ namespace RavenDBMembership.Provider
             using (var session = this.DocumentStore.OpenSession())
             {
                 var q = from u in session.Query<User>()
-                            where u.ApplicationName == this.ApplicationName
+                        where u.ApplicationName == this.ApplicationName
                         select u;
                 IEnumerable<User> results;
                 if (predicate != null)
